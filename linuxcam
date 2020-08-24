@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+
+###################################################################################################
+
+# Constants
+V4L2LOOPBACK_REPO="https://github.com/umlaeute/v4l2loopback/"
+V4L2LOOPBACK_RELEASE="v0.12.5"
+MOK_KEY_PATH="/var/lib/shim-signed/mok"
+VIRTUAL_CAM_FRAMERATE=60
+VIRTUAL_CAM_RESOLUTION="1600x900"
+VIRTUAL_CAM_RESCALE="1280:720"
+VIRTUAL_CAM_DEV="/dev/video50"
+
+# Variables
+help=0
+install=0
+list=0
+test=0
+desktocam=0
+
+###############################################################################
+
+# For each argument
+for i in "$@"
+do
+    # Convert it to Lowercases
+    i=`echo "$i" | tr A-Z a-z`
+
+    # Check for expected arguments
+    if [ "$i" == "-h" ] || [ "$i" == "--help" ]; then
+        help=1
+    elif [ "$i" == "-i" ] || [ "$i" == "--install" ]; then
+        install=1
+    elif [ "$i" == "-l" ] || [ "$i" == "--list" ]; then
+        list=1
+    elif [ "$i" == "-t" ] || [ "$i" == "--test" ]; then
+        test=1
+    elif [ "$i" == "-d" ] || [ "$i" == "--desktocam" ]; then
+        desktocam=1
+    else
+        echo "Ignoring unexpected argument: $i"
+    fi
+done
+
+# If no arguments provided, just shows help
+if [ $# -eq 0 ]; then
+    help=1
+fi
+
+###################################################################################################
+
+# Show help information
+if [ $help -eq 1 ]; then
+    printf "\n"
+    printf "Tool that ease camera video streams checks and allows to setup a virtual camera "
+    printf "to shows system desktop through it.\n"
+    printf "\n"
+    printf "Usage: linuxcam [-h help] [-i install] [-l list] [-t test] [-d desktocam]\n"
+    printf "\n"
+    printf "  -h, --help      : Show this message\n"
+    printf "  -i, --install   : Install usefull softwares\n"
+    printf "  -l, --list      : Detect available cameras\n"
+    printf "  -t, --test      : Check camera stream\n"
+    printf "  -d, --desktocam : Setup a virtual camera that shows system desktop\n"
+    printf "\n"
+    exit 0
+fi
+
+###################################################################################################
+
+# Check for root privileges
+if [ "$(id -u)" != "0" ]; then
+    echo "This script must be executed with administration privileges."
+    echo ""
+    exit 1
+fi
+
+###################################################################################################
+
+# List detected cameras and video channels
+if [ $list -eq 1 ]; then
+    echo "Available Cameras:"
+    echo ""
+    v4l2-ctl --list-devices
+    if [[ $? != 0 ]]; then
+        echo "Error: v4l2-ctl not available. Try to install it first with --install option."
+        echo ""
+        exit 1
+    fi
+    echo ""
+    exit 0
+fi
+
+###################################################################################################
+
+# List detected cameras and video channels
+if [ $test -eq 1 ]; then
+    echo "Testing camera..."
+    guvcview -d $VIRTUAL_CAM_DEV
+    echo ""
+    exit 0
+fi
+
+###################################################################################################
+
+# Sign v4l2loopback Kernel Module
+sign_kernel_module_v4l2loopback()
+{
+    # Check and create random file for openssl if it doesn't exists
+    if [ ! -f $HOME/.rnd ]; then
+        openssl rand -out $HOME/.rnd -hex 256
+    fi
+    # Create a new sign key, sign v4l2loopback module and enroll
+    update-secureboot-policy --new-key
+    kmodsign sha512 $MOK_KEY_PATH/MOK.priv $MOK_KEY_PATH/MOK.der ./v4l2loopback.ko
+    update-secureboot-policy --enroll-key
+    if [[ $? != 0 ]]; then
+        echo "Error: Can't enroll sign key. Try reboot the system."
+        echo ""
+        exit 1
+    fi
+}
+
+# APT update function
+apt_update()
+{
+    echo "-------------------------------------------------"
+    echo " Updating Repositories"
+    echo "-------------------------------------------------"
+    apt-get update
+    echo ""
+}
+
+# APT install package function
+apt_install()
+{
+    if [ $# -gt 0 ]; then
+        echo "-------------------------------------------------"
+        echo " Installing ${1} package"
+        echo "-------------------------------------------------"
+        apt-get -y install $1
+        if [[ $? != 0 ]]; then
+            echo "Error: Can't install ${1} package."
+            echo ""
+            exit 1
+        fi
+        echo ""
+    fi
+}
+
+install_v4l2loopback()
+{
+    # Manually install v4l2loopback
+    echo "-------------------------------------------------"
+    echo " Installing v4l2loopback package"
+    echo "-------------------------------------------------"
+    # Get v4l2loopback source repository
+    git clone $V4L2LOOPBACK_REPO
+    if [[ $? != 0 ]]; then
+        echo "Error: Can't download v4l2loopback source repository."
+        echo ""
+        exit 1
+    fi
+    # Access to downloaded repository, checkout into last release and build it
+    cd v4l2loopback
+    git checkout $V4L2LOOPBACK_RELEASE
+    make
+    if [[ $? != 0 ]]; then
+        echo "Error: v4l2loopback build fail (system has kernel headers?)."
+        cd ..
+        rm -rf v4l2loopback
+        echo ""
+        exit 1
+    fi
+    # Sign the kernel module (for UEFI Secure Boot)
+    sign_kernel_module_v4l2loopback
+    # Install the module
+    make install
+    if [[ $? != 0 ]]; then
+        echo "Error: v4l2loopback installation fail."
+        cd ..
+        rm -rf v4l2loopback
+        echo ""
+        exit 1
+    fi
+    # Refresh kernel modules
+    sudo depmod -a
+    if [[ $? != 0 ]]; then
+        echo "Warning: kernel modules re-calculation fail."
+        echo ""
+    fi
+    # Clean downloaded sources
+    cd ..
+    rm -rf v4l2loopback
+    # Try to load v4l2loopback kernel module
+    modprobe v4l2loopback video_nr=50 &> /dev/null
+    if [[ $? != 0 ]]; then
+        echo "Error: v4l2loopback can't be installed."
+        echo ""
+        exit 1
+    fi
+    # Everything ok, unload it
+    modprobe -r v4l2loopback &> /dev/null
+    echo ""
+}
+
+# Install utils softwares for camera
+if [ $install -eq 1 ]; then
+    apt_update
+    apt_install guvcview
+    apt_install ffmpeg
+    apt_install openssl
+    apt_install mokutil
+    apt_install dkms
+    apt_install v4l-utils
+    apt_install v4l2loopback-utils
+    apt_install v4l2loopback-dkms
+    #install_v4l2loopback # use this instead above to try manually install
+    # Reboot needed
+    printf "\n"
+    printf "Everything has been successfully installed.\n\n"
+    printf "Note that v4l2loopback is a kernel module and a system reboot is required.\n"
+    printf "A blue text screen will be present, choose \"Enroll MOK\", then \"Continue\", \"Yes\" "
+    printf "and input the password that you used before to sign the module.\n"
+    exit 0
+fi
+
+###################################################################################################
+
+# Desktop to Camera (setup virtual desktop camera)
+if [ $desktocam -eq 1 ]; then
+    # Check if ffmpeg is available
+    ffmpeg -h &> /dev/null
+    if [[ $? != 0 ]]; then
+        echo "Error: ffmpeg not available. Try to install it first with --install option."
+        echo ""
+        exit 1
+    fi
+    # Unload and check if v4l2loopback kernel module is available
+    modprobe -r v4l2loopback &> /dev/null
+    modprobe v4l2loopback video_nr=50 &> /dev/null
+    if [[ $? != 0 ]]; then
+        echo "Error: v4l2loopback not available. Try to install it first with --install option."
+        echo ""
+        exit 1
+    fi
+    # Try with display 0
+    ffmpeg -f x11grab -r $VIRTUAL_CAM_FRAMERATE -s $VIRTUAL_CAM_RESOLUTION -i :0 \
+           -vcodec rawvideo -pix_fmt yuv420p -threads 0 -f v4l2 \
+           -vf "scale=${VIRTUAL_CAM_RESCALE}" $VIRTUAL_CAM_DEV
+    if [[ $? != 0 ]]; then
+        # Try with display 1
+        echo ""
+        echo "Error: Can't create the virtual desktop camera on display 0."
+        echo ""
+        echo "Trying on display 1..."
+        echo ""
+        ffmpeg -f x11grab -r $VIRTUAL_CAM_FRAMERATE -s $VIRTUAL_CAM_RESOLUTION -i :1 \
+               -vcodec rawvideo -pix_fmt yuv420p -threads 0 -f v4l2 \
+               -vf "scale=${VIRTUAL_CAM_RESCALE}" $VIRTUAL_CAM_DEV
+        echo ""
+    fi
+    echo "Virtual desktop camera successfully created."
+    echo ""
+    exit 0
+fi
+
+exit 0
